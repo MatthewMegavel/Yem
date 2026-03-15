@@ -8,294 +8,623 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <!-- JSZip for creating PPI/CPI ZIP archives -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#0a0a0f;font-family:'Segoe UI',system-ui,sans-serif;color:#e8e8f0}
+    body{background:#0a0a0f;font-family:'Segoe UI',system-ui,sans-serif;color:#e8e8f0;overflow-x:hidden}
     ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0d0d18}::-webkit-scrollbar-thumb{background:#2a2a3e;border-radius:3px}
-    input,button{font-family:inherit}
-    a{color:inherit}
+    input,button,select{font-family:inherit}
+    code{font-family:'Courier New',monospace}
   </style>
 </head>
 <body>
-  <div id="root"></div>
-  <script type="text/babel">
-const { useState, useCallback, useRef } = React;
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useRef, useEffect } = React;
 
+// ── N27 Parser ────────────────────────────────────────────────────────────────
 function parseN27(buffer) {
   const b = new Uint8Array(buffer);
   if (b.length !== 144) throw new Error(`Invalid .n27: expected 144 bytes, got ${b.length}`);
-  const dec = (s, l) => { let r = ""; for (let i = s; i < s + l && b[i]; i++) r += String.fromCharCode(b[i]); return r; };
-  const u16 = (o) => (b[o] << 8) | b[o + 1];
-  const u32 = (o) => ((b[o] << 24) | (b[o+1] << 16) | (b[o+2] << 8) | b[o+3]) >>> 0;
-  const modelName = dec(0, 64), firmwareHash = dec(0x40, 24), versionHash = dec(0x58, 32);
-  const fwMajor = b[0x7A], fm = b[0x7B], fwMinor = ((fm >> 4) * 10) + (fm & 0xF);
-  const buildNumber = u16(0x7C), flags = b[0x7E], timestamp = u32(0x84), typeCategory = u32(0x88);
-  const modelCode = versionHash.includes("_") ? versionHash.split("_")[0] : "";
-  const MM = {"3008":"PSR-S670","3009":"PSR-S770","3010":"PSR-S970","3011":"PSR-S775","3012":"PSR-S975","4000":"PSR-SX600","4001":"PSR-SX600","4012":"PSR-SX700","4013":"PSR-SX700","4014":"PSR-SX900","4015":"PSR-SX920","4016":"PSR-SX720","4020":"Genos","4021":"Genos 2","3020":"Tyros5","5000":"PSR-E473","5001":"PSR-E363"};
-  return { modelName, firmwareHash, versionHash, modelCode, knownModel: MM[modelCode] || modelName, fwVersion: `${fwMajor}.${String(fwMinor).padStart(2, "0")}`, buildNumber, flags, typeCategory, releaseDate: new Date(timestamp * 1000).toLocaleDateString(), timestamp };
+  const dec = (s,l) => { let r=""; for(let i=s;i<s+l&&b[i];i++) r+=String.fromCharCode(b[i]); return r; };
+  const u16 = (o) => (b[o]<<8)|b[o+1];
+  const u32 = (o) => ((b[o]<<24)|(b[o+1]<<16)|(b[o+2]<<8)|b[o+3])>>>0;
+  const modelName=dec(0,64), firmwareHash=dec(0x40,24), versionHash=dec(0x58,32);
+  const fwMajor=b[0x7A], fm=b[0x7B], fwMinor=((fm>>4)*10)+(fm&0xF);
+  const buildNumber=u16(0x7C), flags=b[0x7E], timestamp=u32(0x84), typeCategory=u32(0x88);
+  const modelCode=versionHash.includes("_")?versionHash.split("_")[0]:"";
+  const MM={"3008":"PSR-S670","3009":"PSR-S770","3010":"PSR-S970","3011":"PSR-S775","3012":"PSR-S975","4000":"PSR-SX600","4001":"PSR-SX600","4012":"PSR-SX700","4013":"PSR-SX700","4014":"PSR-SX900","4015":"PSR-SX920","4016":"PSR-SX720","4020":"Genos","4021":"Genos 2","3020":"Tyros5","5000":"PSR-E473","5001":"PSR-E363"};
+  // Determine target format: older PSR-S → PPI, newer PSR-SX/Genos → CPI
+  const useCPI = ["4000","4001","4012","4013","4014","4015","4016","4020","4021"].includes(modelCode);
+  return { modelName, firmwareHash, versionHash, modelCode, knownModel:MM[modelCode]||modelName,
+    fwVersion:`${fwMajor}.${String(fwMinor).padStart(2,"0")}`, buildNumber, flags, typeCategory,
+    releaseDate:new Date(timestamp*1000).toLocaleDateString(), timestamp, useCPI,
+    installFormat: useCPI ? "CPI" : "PPI" };
 }
 
+// ── PPF/CPF Parser ─────────────────────────────────────────────────────────────
+function parsePPF(buffer) {
+  const data = new Uint8Array(buffer);
+  const u32be = (o) => ((data[o]<<24)|(data[o+1]<<16)|(data[o+2]<<8)|data[o+3])>>>0;
+  const str = (o,l) => { let s=""; for(let i=o;i<o+l&&data[i];i++) s+=String.fromCharCode(data[i]); return s; };
+
+  // Check magic
+  if (str(0,4) !== "XPFH") throw new Error("Not a valid PPF/CPF file (missing XPFH header)");
+  
+  // Check if encrypted (CPF)
+  if (str(8,4) === "ENCI") throw new Error("This is a locked .cpf file (encrypted). Only unlocked .ppf files can be converted.");
+
+  const blobs = [];
+  let packUid = "", packTitle = "";
+  let offset = 0;
+
+  function readChunks(buf, start, end) {
+    let off = start;
+    const chunks = {};
+    while (off < end - 8) {
+      const tag = str(off, 4);
+      if (!/^[\x20-\x7e]{4}$/.test(tag)) break;
+      const size = u32be(off+4);
+      if (size > buf.length) break;
+      chunks[tag] = { offset: off+8, size };
+      off += 8 + size;
+      if (off % 4 !== 0) off += 4 - (off % 4);
+    }
+    return chunks;
+  }
+
+  // Parse top level
+  offset = 0;
+  while (offset < data.length - 8) {
+    const tag = str(offset, 4);
+    if (!/^[\x20-\x7e]{4}$/.test(tag)) break;
+    const size = u32be(offset+4);
+    if (size > data.length) break;
+    
+    if (tag === "EUID") packUid = str(offset+8, size).replace(/\0/g,'');
+    else if (tag === "ETIT") packTitle = str(offset+8, size).replace(/\0/g,'');
+    else if (tag === "BLOB") {
+      const blobData = data.slice(offset+8, offset+8+size);
+      const inner = readChunks(blobData, 0, blobData.length);
+      const blob = {};
+      if (inner.EUID) blob.uid = str(inner.EUID.offset, inner.EUID.size).replace(/\0/g,'');
+      if (inner.ETIT) blob.name = str(inner.ETIT.offset, inner.ETIT.size).replace(/\0/g,'');
+      if (inner.EEXT) blob.ext = str(inner.EEXT.offset, inner.EEXT.size).replace(/\0/g,'');
+      if (inner.EICO) blob.icon = str(inner.EICO.offset, inner.EICO.size).replace(/\0/g,'');
+      if (inner.FBIN) blob.data = data.slice(inner.FBIN.offset, inner.FBIN.offset + inner.FBIN.size);
+      else blob.data = new Uint8Array(0);
+      blobs.push(blob);
+    }
+    offset += 8 + size;
+    if (offset % 4 !== 0) offset += 4 - (offset % 4);
+  }
+
+  return { packUid, packTitle, blobs };
+}
+
+// ── PPI Generator (ZIP format, older PSR-S series) ────────────────────────────
+async function generatePPI(packInfo, ppfData, instrument) {
+  const zip = new JSZip();
+  
+  const voices = ppfData.blobs.filter(b => b.ext === 'uvf');
+  const samples = ppfData.blobs.filter(b => b.ext === 'APCp' || b.ext === 'wav' || b.ext === 'aif');
+  const snaps = ppfData.blobs.filter(b => b.ext === 'SNAP' || b.ext === 'snap');
+  
+  // Generate PackInfo.xml manifest
+  const packInfoXml = `<?xml version="1.0" encoding="UTF-8"?>
+<PackInfo version="1.0">
+  <PackUID>${ppfData.packUid || generateGUID()}</PackUID>
+  <PackTitle>${escapeXml(ppfData.packTitle || packInfo.name)}</PackTitle>
+  <PackVersion>1.0.0</PackVersion>
+  <TargetModel>${instrument.modelName}</TargetModel>
+  <ModelCode>${instrument.modelCode}</ModelCode>
+  <FirmwareVersion>${instrument.fwVersion}</FirmwareVersion>
+  <InstallFormat>PPI</InstallFormat>
+  <ContentCount>
+    <Voices>${voices.length}</Voices>
+    <Samples>${samples.length}</Samples>
+    <Snapshots>${snaps.length}</Snapshots>
+  </ContentCount>
+  <Contents>
+${ppfData.blobs.map(b => `    <Item uid="${escapeXml(b.uid||'')}" name="${escapeXml(b.name||'')}" ext="${escapeXml(b.ext||'')}" size="${b.data.length}"/>`).join('\n')}
+  </Contents>
+</PackInfo>`;
+
+  zip.file("PackInfo.xml", packInfoXml);
+  
+  // Add voices
+  for (const v of voices) {
+    const safeName = sanitizeFilename(v.name || v.uid || 'voice');
+    zip.file(`contents/voices/${safeName}.uvf`, v.data);
+  }
+  
+  // Add samples
+  for (const s of samples) {
+    const safeName = sanitizeFilename(s.name || s.uid || 'sample');
+    zip.file(`contents/samples/${safeName}.${s.ext}`, s.data);
+  }
+  
+  // Add snapshots
+  for (const sn of snaps) {
+    const safeName = sanitizeFilename(sn.name || sn.uid || 'snapshot');
+    zip.file(`contents/snapshots/${safeName}.SNAP`, sn.data);
+  }
+
+  return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
+}
+
+// ── CPI Generator (ZIP format, PSR-SX/Genos series) ──────────────────────────
+async function generateCPI(packInfo, ppfData, instrument) {
+  const zip = new JSZip();
+  
+  const voices = ppfData.blobs.filter(b => b.ext === 'uvf');
+  const samples = ppfData.blobs.filter(b => b.ext === 'APCp' || b.ext === 'wav' || b.ext === 'aif');
+  const snaps = ppfData.blobs.filter(b => b.ext === 'SNAP' || b.ext === 'snap');
+
+  // Generate ContentInfo.xml manifest (newer format for PSR-SX/Genos)
+  const contentInfoXml = `<?xml version="1.0" encoding="UTF-8"?>
+<ContentInfo version="2.0" xmlns="http://www.yamaha.com/cpi">
+  <PackUID>${ppfData.packUid || generateGUID()}</PackUID>
+  <Title>${escapeXml(ppfData.packTitle || packInfo.name)}</Title>
+  <Version>1.0.0</Version>
+  <TargetInstrument>
+    <Model>${instrument.modelName}</Model>
+    <ModelCode>${instrument.modelCode}</ModelCode>
+    <FirmwareVersion>${instrument.fwVersion}</FirmwareVersion>
+    <FirmwareHash>${instrument.firmwareHash}</FirmwareHash>
+    <VersionHash>${instrument.versionHash}</VersionHash>
+  </TargetInstrument>
+  <InstallFormat>CPI</InstallFormat>
+  <Category>ExpansionPack</Category>
+  <ContentItems count="${ppfData.blobs.length}">
+    <VoiceItems count="${voices.length}"/>
+    <SampleItems count="${samples.length}"/>
+    <SnapshotItems count="${snaps.length}"/>
+  </ContentItems>
+  <Manifest>
+${ppfData.blobs.map(b => `    <Item uid="${escapeXml(b.uid||'')}" name="${escapeXml(b.name||'')}" type="${escapeXml(b.ext||'')}" size="${b.data.length}" icon="${escapeXml(b.icon||'')}"/>`).join('\n')}
+  </Manifest>
+</ContentInfo>`;
+
+  zip.file("ContentInfo.xml", contentInfoXml);
+  
+  // Add voices with their UVF XML data
+  for (const v of voices) {
+    const safeName = sanitizeFilename(v.name || v.uid || 'voice');
+    zip.file(`data/voices/${safeName}.uvf`, v.data);
+  }
+  
+  // Add audio samples (FORM/YTWV Yamaha audio format)
+  for (const s of samples) {
+    const safeName = sanitizeFilename(s.name || s.uid || 'sample');
+    zip.file(`data/samples/${safeName}.${s.ext}`, s.data);
+  }
+  
+  // Add snapshots
+  for (const sn of snaps) {
+    const safeName = sanitizeFilename(sn.name || sn.uid || 'snapshot');
+    zip.file(`data/snapshots/${safeName}.SNAP`, sn.data);
+  }
+  
+  // Add instrument binding info
+  const bindingXml = `<?xml version="1.0" encoding="UTF-8"?>
+<InstrumentBinding>
+  <ModelName>${instrument.modelName}</ModelName>
+  <ModelCode>${instrument.modelCode}</ModelCode>
+  <FirmwareVersion>${instrument.fwVersion}</FirmwareVersion>
+  <FirmwareHash>${instrument.firmwareHash}</FirmwareHash>
+  <VersionHash>${instrument.versionHash}</VersionHash>
+  <BuildNumber>${instrument.buildNumber}</BuildNumber>
+  <Timestamp>${instrument.timestamp}</Timestamp>
+</InstrumentBinding>`;
+  zip.file("InstrumentBinding.xml", bindingXml);
+
+  return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function generateGUID() {
-  const h = () => Math.floor(Math.random() * 16).toString(16);
-  const s = (n) => Array.from({ length: n }, h).join("");
+  const h=()=>Math.floor(Math.random()*16).toString(16), s=(n)=>Array.from({length:n},h).join("");
   return `{${s(8)}-${s(4)}-${s(4)}-${s(4)}-${s(12)}}`;
 }
-
-function concatArrays(arrays) {
-  const total = arrays.reduce((s, a) => s + a.length, 0);
-  const out = new Uint8Array(total); let off = 0;
-  for (const a of arrays) { out.set(a, off); off += a.length; }
-  return out;
+function escapeXml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function sanitizeFilename(s) {
+  return String(s).replace(/[^a-zA-Z0-9_\-. ]/g,'_').trim() || 'file';
+}
+function fmtSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024*1024) return `${(bytes/1024).toFixed(1)} KB`;
+  return `${(bytes/1024/1024).toFixed(2)} MB`;
 }
 
-function writeChunk(tag, data) {
-  const tb = new TextEncoder().encode(tag.padEnd(4, " ").slice(0, 4));
-  const h = new Uint8Array(8); h.set(tb, 0);
-  new DataView(h.buffer).setUint32(4, data.length, false);
-  const p = (4 - (data.length % 4)) % 4;
-  return [h, data, new Uint8Array(p)];
-}
-
-function generatePPF(name, items) {
-  const enc = new TextEncoder();
-  const ns = (s) => { const b = enc.encode(s), o = new Uint8Array(b.length + 1); o.set(b); return o; };
-  const parts = [];
-  parts.push(...writeChunk("XPFH", new Uint8Array(0)));
-  parts.push(...writeChunk("EUID", ns(generateGUID())));
-  parts.push(...writeChunk("ETIT", ns(name)));
-  for (const it of items) {
-    const bl = [];
-    bl.push(...writeChunk("EUID", ns(it.uid || generateGUID())));
-    bl.push(...writeChunk("ETIT", ns(it.name)));
-    bl.push(...writeChunk("EEXT", ns(it.ext)));
-    if (it.icon) bl.push(...writeChunk("EICO", ns(it.icon)));
-    bl.push(...writeChunk("FBIN", it.data));
-    parts.push(...writeChunk("BLOB", concatArrays(bl)));
-  }
-  return concatArrays(parts);
-}
-
-const C = { bg:"#0a0a0f",s:"#13131f",b:"#1e1e2e",a:"#e94560",t:"#e8e8f0",m:"#666",g:"#4ade80",am:"#f59e0b" };
-const $ = {
-  card:{background:C.s,border:`1px solid ${C.b}`,borderRadius:12,padding:24,marginBottom:20},
-  cardHead:{fontSize:12,fontWeight:700,letterSpacing:2,color:C.a,textTransform:"uppercase",marginBottom:16,display:"flex",alignItems:"center",gap:8},
-  btn:{padding:"10px 20px",borderRadius:8,border:"none",cursor:"pointer",fontWeight:700,fontSize:14,background:`linear-gradient(135deg,${C.a},#c73652)`,color:"#fff",boxShadow:"0 4px 15px rgba(233,69,96,0.3)"},
-  ghost:{padding:"6px 14px",borderRadius:6,border:"1px solid rgba(233,69,96,0.3)",cursor:"pointer",background:"rgba(233,69,96,0.08)",color:C.a,fontWeight:600,fontSize:13},
-  sec:{padding:"8px 14px",borderRadius:6,border:`1px solid ${C.b}`,cursor:"pointer",background:"#1e1e2e",color:C.m,fontWeight:600,fontSize:13},
-  drop:(d)=>({border:`2px dashed ${d?C.a:C.b}`,borderRadius:12,padding:"44px 40px",textAlign:"center",cursor:"pointer",background:d?"rgba(233,69,96,0.05)":"transparent",color:d?C.a:C.m,transition:"all 0.2s"}),
-  cell:{background:"#0d0d18",border:"1px solid #1a1a2a",borderRadius:8,padding:"12px 16px"},
-  tag:(c=C.a)=>({display:"inline-block",padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:700,background:`${c}22`,color:c,border:`1px solid ${c}44`,letterSpacing:0.5}),
-  input:{width:"100%",padding:"10px 14px",background:"#0d0d18",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:14,outline:"none",boxSizing:"border-box"},
+// ── Theme ─────────────────────────────────────────────────────────────────────
+const C = { bg:"#0a0a0f", s:"#13131f", b:"#1e1e2e", a:"#e94560", t:"#e8e8f0", m:"#666", g:"#4ade80", am:"#f59e0b", blue:"#60a5fa" };
+const S = {
+  card: { background:C.s, border:`1px solid ${C.b}`, borderRadius:12, padding:24, marginBottom:20 },
+  head: { fontSize:12, fontWeight:700, letterSpacing:2, color:C.a, textTransform:"uppercase", marginBottom:16, display:"flex", alignItems:"center", gap:8 },
+  btn: { padding:"10px 20px", borderRadius:8, border:"none", cursor:"pointer", fontWeight:700, fontSize:14, background:`linear-gradient(135deg,${C.a},#c73652)`, color:"#fff", boxShadow:"0 4px 15px rgba(233,69,96,0.3)", transition:"all 0.15s" },
+  ghost: { padding:"7px 14px", borderRadius:6, border:`1px solid rgba(233,69,96,0.3)`, cursor:"pointer", background:"rgba(233,69,96,0.08)", color:C.a, fontWeight:600, fontSize:13 },
+  sec: { padding:"7px 14px", borderRadius:6, border:`1px solid ${C.b}`, cursor:"pointer", background:"#1e1e2e", color:C.m, fontWeight:600, fontSize:13 },
+  drop: (d) => ({ border:`2px dashed ${d?C.a:C.b}`, borderRadius:12, padding:"44px 32px", textAlign:"center", cursor:"pointer", background:d?"rgba(233,69,96,0.06)":"rgba(255,255,255,0.01)", color:d?C.a:C.m, transition:"all 0.2s" }),
+  cell: { background:"#0d0d18", border:"1px solid #1a1a2a", borderRadius:8, padding:"12px 16px" },
+  tag: (c=C.a) => ({ display:"inline-block", padding:"2px 9px", borderRadius:4, fontSize:11, fontWeight:700, background:`${c}22`, color:c, border:`1px solid ${c}44`, letterSpacing:0.5 }),
+  inp: { width:"100%", padding:"10px 14px", background:"#0d0d18", border:`1px solid ${C.b}`, borderRadius:8, color:C.t, fontSize:14, outline:"none", boxSizing:"border-box" },
 };
 
+// ── Main App ──────────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab] = useState("instrument");
   const [inst, setInst] = useState(null);
-  const [err, setErr] = useState(null);
+  const [n27Err, setN27Err] = useState(null);
   const [dragN, setDragN] = useState(false);
   const [packs, setPacks] = useState([]);
   const [dragP, setDragP] = useState(false);
   const [packName, setPackName] = useState("My Expansion Pack");
-  const [gen, setGen] = useState({ loading: false, pct: 0, result: null });
-  const n27R = useRef(), pkR = useRef();
+  const [gen, setGen] = useState({ loading:false, pct:0, log:[], result:null });
+  const n27R=useRef(), pkR=useRef();
 
+  // Load N27
   const loadN27 = useCallback(async (f) => {
-    if (!f.name.toLowerCase().endsWith(".n27")) { setErr("Must be a .n27 Instrument Info file"); return; }
-    try { const i = parseN27(await f.arrayBuffer()); setInst(i); setErr(null); setPackName(`${i.modelName} Pack`); }
-    catch (e) { setErr(e.message); }
+    if (!f.name.toLowerCase().endsWith(".n27")) { setN27Err("Must be a .n27 Instrument Info file"); return; }
+    try { const i=parseN27(await f.arrayBuffer()); setInst(i); setN27Err(null); setPackName(`${i.modelName} Pack`); }
+    catch(e) { setN27Err(e.message); }
   }, []);
 
+  // Load PPF/CPF packs
   const loadPacks = useCallback(async (files) => {
-    const added = [];
+    const added=[];
     for (const f of Array.from(files)) {
       const ext = f.name.split(".").pop().toLowerCase();
-      if (!["ppf","ppi"].includes(ext)) continue;
-      added.push({ id: Math.random().toString(36).slice(2), name: f.name.replace(/\.[^.]+$/, ""), ext, size: f.size, data: new Uint8Array(await f.arrayBuffer()) });
+      if (!["ppf","cpf","ppi"].includes(ext)) continue;
+      const buf = await f.arrayBuffer();
+      let info = { id:Math.random().toString(36).slice(2), filename:f.name, size:f.size, ext, data:new Uint8Array(buf), error:null };
+      try {
+        const parsed = parsePPF(buf);
+        info.parsed = parsed;
+        info.title = parsed.packTitle || f.name.replace(/\.[^.]+$/,'');
+        info.itemCount = parsed.blobs.length;
+        info.voices = parsed.blobs.filter(b=>b.ext==='uvf').length;
+        info.samples = parsed.blobs.filter(b=>b.ext==='APCp'||b.ext==='wav').length;
+      } catch(e) {
+        info.error = e.message;
+        info.title = f.name.replace(/\.[^.]+$/,'');
+      }
+      added.push(info);
     }
-    setPacks(p => [...p, ...added]);
+    setPacks(p=>[...p,...added]);
   }, []);
 
+  // Generate installation file
   const generate = useCallback(async () => {
-    if (!inst) return;
-    setGen({ loading: true, pct: 0, result: null });
-    await new Promise(r => setTimeout(r, 100)); setGen(g => ({ ...g, pct: 30 }));
-    const items = packs.length > 0
-      ? packs.map(p => ({ uid: generateGUID(), name: p.name, ext: p.ext, data: p.data }))
-      : [{ uid: generateGUID(), name: "InstrumentInfo", ext: "json", data: new TextEncoder().encode(JSON.stringify({ model: inst.modelName, modelCode: inst.modelCode, firmware: inst.fwVersion, hash: inst.firmwareHash, versionHash: inst.versionHash, buildNumber: inst.buildNumber }, null, 2)) }];
-    await new Promise(r => setTimeout(r, 300)); setGen(g => ({ ...g, pct: 70 }));
+    if (!inst || packs.length === 0) return;
+    const log = [];
+    const addLog = (msg, type='info') => { log.push({msg, type, t:Date.now()}); setGen(g=>({...g,log:[...log]})); };
+    
+    setGen({loading:true, pct:0, log:[], result:null});
+    const fmt = inst.installFormat; // PPI or CPI
+    addLog(`Starting ${fmt} generation for ${inst.modelName}...`);
+    
     try {
-      const ppf = generatePPF(packName, items);
-      await new Promise(r => setTimeout(r, 200)); setGen(g => ({ ...g, pct: 95 }));
-      const url = URL.createObjectURL(new Blob([ppf], { type: "application/octet-stream" }));
-      const filename = `${inst.modelName}_${packName.replace(/\s+/g, "_")}.ppf`;
-      setGen({ loading: false, pct: 100, result: { url, filename, size: ppf.length } });
-    } catch (e) { setGen({ loading: false, pct: 0, result: { error: e.message } }); }
+      const results = [];
+      for (let i=0; i<packs.length; i++) {
+        const pack = packs[i];
+        if (pack.error) { addLog(`Skipping '${pack.title}' (${pack.error})`, 'warn'); continue; }
+        
+        const pct = Math.round((i/packs.length)*80);
+        setGen(g=>({...g,pct}));
+        addLog(`Processing '${pack.title}' (${pack.voices} voices, ${pack.samples} samples)...`);
+        await new Promise(r=>setTimeout(r,50));
+        
+        let outData;
+        if (fmt === 'CPI') {
+          addLog(`  → Generating CPI (PSR-SX/Genos format)...`);
+          outData = await generateCPI({name:packName}, pack.parsed, inst);
+        } else {
+          addLog(`  → Generating PPI (PSR-S series format)...`);
+          outData = await generatePPI({name:packName}, pack.parsed, inst);
+        }
+        
+        const ext = fmt.toLowerCase();
+        const fname = `${inst.modelName}_${sanitizeFilename(pack.title)}.${ext}`;
+        const url = URL.createObjectURL(new Blob([outData], {type:"application/octet-stream"}));
+        results.push({url, fname, size:outData.length, title:pack.title});
+        addLog(`  ✓ Generated: ${fname} (${fmtSize(outData.length)})`, 'success');
+      }
+      
+      setGen(g=>({...g, pct:100, loading:false, result:{files:results, fmt}}));
+      addLog(`Done! ${results.length} ${fmt} file(s) ready for download.`, 'success');
+    } catch(e) {
+      addLog(`Error: ${e.message}`, 'error');
+      setGen(g=>({...g, loading:false, pct:0, result:{error:e.message}}));
+    }
   }, [inst, packs, packName]);
 
-  const TABS = [
-    { id:"instrument", icon:"🎹", label:"Instrument" },
-    { id:"packs",      icon:"📦", label:"Add Packs"  },
-    { id:"generate",   icon:"⚡", label:"Generate"   },
-    { id:"about",      icon:"ℹ️",  label:"About"      },
-  ];
+  const TABS = [{id:"instrument",icon:"🎹",label:"Instrument"},{id:"packs",icon:"📦",label:"Pack Files"},{id:"generate",icon:"⚡",label:"Convert"},{id:"about",icon:"ℹ️",label:"About"}];
 
   return (
-    <div style={{ minHeight:"100vh", background:C.bg, color:C.t, display:"flex", flexDirection:"column" }}>
-      <header style={{ background:"linear-gradient(135deg,#1a1a2e,#0f3460)", borderBottom:`2px solid ${C.a}`, padding:"0 24px", display:"flex", alignItems:"center", gap:16, height:58, boxShadow:"0 2px 24px rgba(233,69,96,0.2)", flexShrink:0 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10, fontSize:17, fontWeight:700, color:"#fff" }}>
-          <div style={{ width:32, height:32, background:`linear-gradient(135deg,${C.a},#0f3460)`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🎵</div>
+    <div style={{minHeight:"100vh",background:C.bg,color:C.t,display:"flex",flexDirection:"column"}}>
+      
+      {/* Header */}
+      <header style={{background:"linear-gradient(135deg,#1a1a2e,#0f3460)",borderBottom:`2px solid ${C.a}`,padding:"0 24px",display:"flex",alignItems:"center",gap:16,height:58,boxShadow:"0 2px 24px rgba(233,69,96,0.2)",flexShrink:0}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,fontSize:17,fontWeight:700,color:"#fff"}}>
+          <div style={{width:32,height:32,background:`linear-gradient(135deg,${C.a},#0f3460)`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>🎵</div>
           Yamaha Expansion Manager
         </div>
-        <div style={{ marginLeft:"auto", display:"flex", gap:10, alignItems:"center" }}>
-          {inst && <span style={$.tag(C.g)}>✓ {inst.modelName}</span>}
-          {packs.length > 0 && <span style={$.tag(C.am)}>{packs.length} pack{packs.length>1?"s":""}</span>}
+        <div style={{marginLeft:"auto",display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          {inst && <span style={S.tag(C.g)}>✓ {inst.modelName}</span>}
+          {inst && <span style={S.tag(C.blue)}>{inst.installFormat} Mode</span>}
+          {packs.filter(p=>!p.error).length > 0 && <span style={S.tag(C.am)}>{packs.filter(p=>!p.error).length} pack(s)</span>}
         </div>
       </header>
-      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
-        <nav style={{ width:210, background:"#0d0d18", borderRight:`1px solid ${C.b}`, display:"flex", flexDirection:"column", paddingTop:8, flexShrink:0 }}>
-          {TABS.map(t => (
-            <div key={t.id} style={{ display:"flex", alignItems:"center", gap:12, padding:"11px 20px", cursor:"pointer", borderLeft:`3px solid ${tab===t.id?C.a:"transparent"}`, background:tab===t.id?"rgba(233,69,96,0.12)":"transparent", color:tab===t.id?C.a:C.m, fontSize:14, fontWeight:tab===t.id?600:400, transition:"all 0.15s" }} onClick={()=>setTab(t.id)}>
+
+      <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+        {/* Sidebar */}
+        <nav style={{width:210,background:"#0d0d18",borderRight:`1px solid ${C.b}`,display:"flex",flexDirection:"column",paddingTop:8,flexShrink:0}}>
+          {TABS.map(t=>(
+            <div key={t.id} style={{display:"flex",alignItems:"center",gap:12,padding:"11px 20px",cursor:"pointer",borderLeft:`3px solid ${tab===t.id?C.a:"transparent"}`,background:tab===t.id?"rgba(233,69,96,0.12)":"transparent",color:tab===t.id?C.a:C.m,fontSize:14,fontWeight:tab===t.id?600:400,transition:"all 0.15s"}} onClick={()=>setTab(t.id)}>
               <span style={{fontSize:18}}>{t.icon}</span>{t.label}
             </div>
           ))}
-          {inst && (
-            <div style={{ marginTop:"auto", padding:16, borderTop:`1px solid ${C.b}` }}>
-              <div style={{ fontSize:11, color:"#333", marginBottom:5, letterSpacing:1, textTransform:"uppercase" }}>Instrument</div>
-              <div style={{ fontSize:13, fontWeight:700 }}>{inst.modelName}</div>
-              <div style={{ fontSize:11, color:C.m, marginTop:3 }}>FW v{inst.fwVersion} • #{inst.buildNumber}</div>
-              <div style={{ fontSize:11, color:C.m, marginTop:5 }}>{packs.length} pack(s) queued</div>
-            </div>
-          )}
+          {inst && <div style={{marginTop:"auto",padding:16,borderTop:`1px solid ${C.b}`}}>
+            <div style={{fontSize:11,color:"#333",marginBottom:5,letterSpacing:1,textTransform:"uppercase"}}>Instrument</div>
+            <div style={{fontSize:13,fontWeight:700}}>{inst.modelName}</div>
+            <div style={{fontSize:11,color:C.m,marginTop:3}}>FW v{inst.fwVersion}</div>
+            <div style={{fontSize:11,marginTop:5}}><span style={S.tag(C.blue)}>{inst.installFormat}</span></div>
+            <div style={{fontSize:11,color:C.m,marginTop:5}}>{packs.filter(p=>!p.error).length} pack(s) loaded</div>
+          </div>}
         </nav>
-        <main style={{ flex:1, padding:"28px 32px", overflowY:"auto" }}>
 
+        {/* Content */}
+        <main style={{flex:1,padding:"28px 32px",overflowY:"auto"}}>
+
+          {/* ══ INSTRUMENT ══ */}
           {tab==="instrument" && <div>
             <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Import Instrument Info</h2>
-            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Load your keyboard's .n27 file to detect model, firmware, and generate compatible packs.</p>
-            <div style={$.card}>
-              <div style={$.cardHead}>📋 How to get your .n27 file</div>
-              {["Connect your Yamaha keyboard to PC/Mac via USB","Open the official Yamaha Expansion Manager on your computer",'Go to Tools → "Export Instrument Information"',"Select your keyboard model and save the .n27 file","Import that .n27 file here below ↓"].map((s,i)=>(
+            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Load your keyboard's .n27 file. This tells the app your model and firmware so it generates the correct .ppi or .cpi installation format.</p>
+
+            <div style={S.card}>
+              <div style={S.head}>📋 How to get your .n27 file</div>
+              {["Connect your Yamaha keyboard to PC/Mac via USB","Open the official Yamaha Expansion Manager on your computer",'Go to Tools → "Export Instrument Information"',"Select your keyboard model → save the .n27 file","Import that .n27 file below ↓"].map((s,i)=>(
                 <div key={i} style={{display:"flex",gap:12,marginBottom:10,fontSize:14,color:C.m,alignItems:"flex-start"}}>
-                  <span style={{...$.tag(),minWidth:22,textAlign:"center",flexShrink:0}}>{i+1}</span><span>{s}</span>
+                  <span style={{...S.tag(),minWidth:22,textAlign:"center",flexShrink:0}}>{i+1}</span><span>{s}</span>
                 </div>
               ))}
             </div>
-            <div style={$.card}>
-              <div style={$.cardHead}>📂 Import .n27 File</div>
-              <div style={$.drop(dragN)} onDragOver={e=>{e.preventDefault();setDragN(true)}} onDragLeave={()=>setDragN(false)} onDrop={e=>{e.preventDefault();setDragN(false);if(e.dataTransfer.files[0])loadN27(e.dataTransfer.files[0])}} onClick={()=>n27R.current&&n27R.current.click()}>
+
+            <div style={S.card}>
+              <div style={S.head}>📂 Import .n27 File</div>
+              <div style={S.drop(dragN)} onDragOver={e=>{e.preventDefault();setDragN(true)}} onDragLeave={()=>setDragN(false)} onDrop={e=>{e.preventDefault();setDragN(false);if(e.dataTransfer.files[0])loadN27(e.dataTransfer.files[0])}} onClick={()=>n27R.current&&n27R.current.click()}>
                 <div style={{fontSize:52,marginBottom:14}}>🎹</div>
                 <div style={{fontSize:16,fontWeight:600,marginBottom:6}}>Drop .n27 file here or click to browse</div>
-                <div style={{fontSize:12,marginTop:8,color:"#444"}}>PSR-SX600/700/900 • Genos 1/2 • PSR-S Series • Tyros5</div>
+                <div style={{fontSize:12,marginTop:8,color:"#444"}}>PSR-SX600/700/900 • Genos 1/2 • PSR-S670/770/970 • Tyros5</div>
               </div>
               <input ref={n27R} type="file" accept=".n27" style={{display:"none"}} onChange={e=>e.target.files[0]&&loadN27(e.target.files[0])}/>
-              {err && <div style={{marginTop:12,padding:12,background:"rgba(233,69,96,0.1)",border:"1px solid rgba(233,69,96,0.3)",borderRadius:8,color:C.a,fontSize:13}}>⚠️ {err}</div>}
+              {n27Err && <div style={{marginTop:12,padding:12,background:"rgba(233,69,96,0.1)",border:"1px solid rgba(233,69,96,0.3)",borderRadius:8,color:C.a,fontSize:13}}>⚠️ {n27Err}</div>}
             </div>
-            {inst && <div style={$.card}>
-              <div style={{...$.cardHead,justifyContent:"space-between"}}><span>✅ Instrument Detected</span><span style={$.tag(C.g)}>Valid .n27</span></div>
+
+            {inst && <div style={S.card}>
+              <div style={{...S.head,justifyContent:"space-between"}}>
+                <span>✅ Instrument Detected</span>
+                <div style={{display:"flex",gap:8}}>
+                  <span style={S.tag(C.g)}>Valid</span>
+                  <span style={S.tag(C.blue)}>→ .{inst.installFormat.toLowerCase()}</span>
+                </div>
+              </div>
+              
+              {/* Install format notice */}
+              <div style={{padding:14,background:`rgba(96,165,250,0.08)`,border:`1px solid rgba(96,165,250,0.25)`,borderRadius:8,marginBottom:16,fontSize:13}}>
+                <strong style={{color:C.blue}}>Installation Format: .{inst.installFormat.toLowerCase()}</strong>
+                <div style={{color:C.m,marginTop:4}}>
+                  {inst.useCPI ? "Your PSR-SX/Genos keyboard uses CPI format (Content Package Install) — a ZIP archive with ContentInfo.xml manifest." : "Your PSR-S keyboard uses PPI format (Pack Package Install) — a ZIP archive with PackInfo.xml manifest."}
+                </div>
+              </div>
+
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:20}}>
-                {[["Model Name",inst.modelName],["Known As",inst.knownModel],["Firmware",`v${inst.fwVersion}`],["Build Number",`#${inst.buildNumber}`],["Model Code",inst.modelCode],["FW Hash",inst.firmwareHash],["Version Hash",inst.versionHash],["Release Date",inst.releaseDate],["Type Category",String(inst.typeCategory)],["Flags",`0x${inst.flags.toString(16).toUpperCase()}`]].map(([l,v])=>(
-                  <div key={l} style={$.cell}><div style={{fontSize:11,color:C.m,marginBottom:4,letterSpacing:1,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:l.includes("Hash")?11:14,fontWeight:600,wordBreak:"break-all"}}>{v}</div></div>
+                {[["Model Name",inst.modelName],["Known As",inst.knownModel],["Firmware",`v${inst.fwVersion}`],["Build",`#${inst.buildNumber}`],["Model Code",inst.modelCode],["FW Hash",inst.firmwareHash],["Version Hash",inst.versionHash],["Release Date",inst.releaseDate]].map(([l,v])=>(
+                  <div key={l} style={S.cell}><div style={{fontSize:11,color:C.m,marginBottom:4,letterSpacing:1,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:l.includes("Hash")?11:14,fontWeight:600,wordBreak:"break-all"}}>{v}</div></div>
                 ))}
               </div>
               <div style={{display:"flex",gap:12}}>
-                <button style={$.btn} onClick={()=>setTab("packs")}>Continue → Add Packs</button>
-                <button style={$.ghost} onClick={()=>{setInst(null);setErr(null);setPackName("My Expansion Pack")}}>Reset</button>
+                <button style={S.btn} onClick={()=>setTab("packs")}>Continue → Add Packs</button>
+                <button style={S.ghost} onClick={()=>{setInst(null);setN27Err(null)}}>Reset</button>
               </div>
             </div>}
           </div>}
 
+          {/* ══ PACKS ══ */}
           {tab==="packs" && <div>
-            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Add Expansion Packs</h2>
-            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Import .ppf or .ppi unlocked pack files to bundle into your installation.</p>
-            {!inst && <div style={{...$.card,borderColor:"rgba(233,69,96,0.3)",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Import Pack Files</h2>
+            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Load your .ppf (unlocked) pack files. These will be converted to {inst?`.${inst.installFormat.toLowerCase()}`:"PPI/CPI"} installation packages.</p>
+
+            {!inst && <div style={{...S.card,borderColor:"rgba(233,69,96,0.3)",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap",marginBottom:20}}>
               <span style={{color:C.a,fontSize:14}}>⚠️ Import your .n27 instrument file first.</span>
-              <button style={$.ghost} onClick={()=>setTab("instrument")}>Go to Instrument →</button>
+              <button style={S.ghost} onClick={()=>setTab("instrument")}>Go to Instrument →</button>
             </div>}
-            <div style={$.card}>
-              <div style={$.cardHead}>📂 Import Pack Files</div>
-              <div style={$.drop(dragP)} onDragOver={e=>{e.preventDefault();setDragP(true)}} onDragLeave={()=>setDragP(false)} onDrop={e=>{e.preventDefault();setDragP(false);loadPacks(e.dataTransfer.files)}} onClick={()=>pkR.current&&pkR.current.click()}>
+
+            <div style={S.card}>
+              <div style={S.head}>📂 Import .ppf Pack Files</div>
+              <div style={S.drop(dragP)} onDragOver={e=>{e.preventDefault();setDragP(true)}} onDragLeave={()=>setDragP(false)} onDrop={e=>{e.preventDefault();setDragP(false);loadPacks(e.dataTransfer.files)}} onClick={()=>pkR.current&&pkR.current.click()}>
                 <div style={{fontSize:48,marginBottom:14}}>📦</div>
-                <div style={{fontSize:16,fontWeight:600,marginBottom:6}}>Drop .ppf / .ppi files here</div>
-                <div style={{fontSize:13}}>or click to browse — multiple files supported</div>
-                <div style={{fontSize:11,marginTop:8,color:"#444"}}>Unlocked .ppf and .ppi only (encrypted .cpf not supported)</div>
+                <div style={{fontSize:16,fontWeight:600,marginBottom:6}}>Drop .ppf files here or click to browse</div>
+                <div style={{fontSize:13,marginBottom:8}}>Multiple files supported</div>
+                <div style={{fontSize:11,color:"#444"}}>
+                  .ppf = Unlocked pack ✓ &nbsp;|&nbsp; .cpf = Locked (encrypted, cannot convert) ✗
+                </div>
               </div>
-              <input ref={pkR} type="file" accept=".ppf,.ppi" multiple style={{display:"none"}} onChange={e=>e.target.files.length&&loadPacks(e.target.files)}/>
+              <input ref={pkR} type="file" accept=".ppf,.cpf" multiple style={{display:"none"}} onChange={e=>e.target.files.length&&loadPacks(e.target.files)}/>
             </div>
-            {packs.length>0 && <div style={$.card}>
-              <div style={{...$.cardHead,justifyContent:"space-between"}}>
+
+            {packs.length > 0 && <div style={S.card}>
+              <div style={{...S.head,justifyContent:"space-between"}}>
                 <span>📋 Loaded Packs ({packs.length})</span>
-                <button style={{...$.sec,padding:"4px 12px",fontSize:12}} onClick={()=>setPacks([])}>Clear All</button>
+                <button style={{...S.sec,padding:"4px 12px",fontSize:12}} onClick={()=>setPacks([])}>Clear All</button>
               </div>
               {packs.map(p=>(
-                <div key={p.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"#0d0d18",borderRadius:8,marginBottom:8,border:"1px solid #1a1a2a"}}>
-                  <span style={{fontSize:24}}>📦</span>
+                <div key={p.id} style={{display:"flex",gap:14,padding:"12px 14px",background:"#0d0d18",borderRadius:8,marginBottom:8,border:`1px solid ${p.error?"rgba(233,69,96,0.3)":"#1a1a2a"}`,alignItems:"flex-start"}}>
+                  <span style={{fontSize:26,flexShrink:0}}>{p.error?"❌":"📦"}</span>
                   <div style={{flex:1}}>
-                    <div style={{fontSize:14,fontWeight:600}}>{p.name}</div>
-                    <div style={{fontSize:12,color:C.m,marginTop:2}}>.{p.ext.toUpperCase()} • {(p.size/1024/1024).toFixed(2)} MB</div>
+                    <div style={{fontSize:14,fontWeight:600,marginBottom:3}}>{p.title}</div>
+                    {p.error 
+                      ? <div style={{fontSize:12,color:C.a}}>{p.error}</div>
+                      : <div style={{fontSize:12,color:C.m}}>
+                          .{p.ext.toUpperCase()} • {fmtSize(p.size)} • {p.itemCount} items 
+                          ({p.voices} voice{p.voices!==1?"s":""}, {p.samples} sample{p.samples!==1?"s":""})
+                          {inst && <span style={{...S.tag(C.blue),marginLeft:8}}>→ .{inst.installFormat.toLowerCase()}</span>}
+                        </div>
+                    }
                   </div>
-                  <button style={{...$.sec,padding:"3px 10px",fontSize:12}} onClick={()=>setPacks(x=>x.filter(i=>i.id!==p.id))}>✕</button>
+                  <button style={{...S.sec,padding:"3px 10px",fontSize:12,flexShrink:0}} onClick={()=>setPacks(x=>x.filter(i=>i.id!==p.id))}>✕</button>
                 </div>
               ))}
-              <div style={{marginTop:16}}><button style={$.btn} onClick={()=>setTab("generate")}>Continue → Generate</button></div>
+              {packs.some(p=>!p.error) && <div style={{marginTop:16}}>
+                <button style={S.btn} onClick={()=>setTab("generate")}>Continue → Convert</button>
+              </div>}
             </div>}
-            {packs.length===0&&inst && <div style={{...$.card,textAlign:"center",color:C.m}}>
+
+            {packs.length===0 && <div style={{...S.card,textAlign:"center",color:C.m,padding:40}}>
               <div style={{fontSize:36,marginBottom:10}}>💡</div>
-              <div style={{marginBottom:12,fontSize:14}}>No packs loaded — you can generate instrument metadata only.</div>
-              <button style={$.ghost} onClick={()=>setTab("generate")}>Skip → Generate →</button>
+              <div style={{fontSize:14}}>No pack files loaded yet. Drop your .ppf files above.</div>
             </div>}
           </div>}
 
+          {/* ══ GENERATE/CONVERT ══ */}
           {tab==="generate" && <div>
-            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Generate Installation File</h2>
-            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Create a .ppf installation file for {inst?inst.modelName:"your keyboard"}.</p>
-            {!inst ? <div style={{...$.card,textAlign:"center",padding:48}}>
+            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Convert to Installation File</h2>
+            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>
+              Convert your .ppf packs to {inst?<strong style={{color:C.blue}}>.{inst.installFormat.toLowerCase()}</strong>:"PPI/CPI"} installation packages ready to load onto your keyboard.
+            </p>
+
+            {!inst ? <div style={{...S.card,textAlign:"center",padding:48}}>
               <div style={{fontSize:48,marginBottom:14}}>⚠️</div>
               <div style={{fontWeight:600,marginBottom:14,fontSize:16}}>No instrument loaded</div>
-              <button style={$.btn} onClick={()=>setTab("instrument")}>Import .n27 First</button>
+              <button style={S.btn} onClick={()=>setTab("instrument")}>Import .n27 First</button>
+            </div> : packs.filter(p=>!p.error).length === 0 ? <div style={{...S.card,textAlign:"center",padding:48}}>
+              <div style={{fontSize:48,marginBottom:14}}>📦</div>
+              <div style={{fontWeight:600,marginBottom:14,fontSize:16}}>No valid pack files loaded</div>
+              <button style={S.btn} onClick={()=>setTab("packs")}>Import Pack Files</button>
             </div> : <>
-              <div style={$.card}>
-                <div style={$.cardHead}>📋 Generation Summary</div>
-                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}}>
-                  {[["Target",inst.modelName],["Firmware",`v${inst.fwVersion}`],["Packs",`${packs.length} file${packs.length!==1?"s":""}`],["Output",".PPF Unlocked"]].map(([l,v])=>(
-                    <div key={l} style={$.cell}><div style={{fontSize:11,color:C.m,marginBottom:4,letterSpacing:1,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:14,fontWeight:700}}>{v}</div></div>
+
+              {/* Format explanation */}
+              <div style={{...S.card,borderColor:`rgba(96,165,250,0.3)`,background:"rgba(96,165,250,0.04)"}}>
+                <div style={{...S.head,color:C.blue}}>📋 Conversion Summary</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10,marginBottom:16}}>
+                  {[["Input Format",packs.filter(p=>!p.error).map(p=>`.${p.ext}`).join(', ')],["Output Format",`.${inst.installFormat.toLowerCase()}`],["Target",inst.modelName],["Packs",`${packs.filter(p=>!p.error).length} file(s)`]].map(([l,v])=>(
+                    <div key={l} style={S.cell}><div style={{fontSize:11,color:C.m,marginBottom:4,letterSpacing:1,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:14,fontWeight:700,color:l==="Output Format"?C.blue:C.t}}>{v}</div></div>
                   ))}
                 </div>
+                <div style={{fontSize:13,color:C.m,lineHeight:1.6}}>
+                  <strong style={{color:C.t}}>What happens:</strong> Each .ppf is unpacked (voices + samples extracted), 
+                  a {inst.useCPI?"ContentInfo.xml":"PackInfo.xml"} manifest is generated with your instrument's binding info, 
+                  and everything is repackaged into a .{inst.installFormat.toLowerCase()} ZIP archive.
+                </div>
               </div>
-              <div style={$.card}>
-                <div style={$.cardHead}>✏️ Pack Name</div>
-                <input style={$.input} value={packName} onChange={e=>setPackName(e.target.value)} placeholder="Enter pack name..."/>
-                <div style={{fontSize:11,color:"#444",marginTop:8}}>Output: {inst.modelName}_{packName.replace(/\s+/g,"_")}.ppf</div>
+
+              {/* Pack list preview */}
+              <div style={S.card}>
+                <div style={S.head}>📦 Files to Convert ({packs.filter(p=>!p.error).length})</div>
+                {packs.filter(p=>!p.error).map(p=>(
+                  <div key={p.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"#0d0d18",borderRadius:8,marginBottom:8,border:"1px solid #1a1a2a"}}>
+                    <span style={{fontSize:22}}>📦</span>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:14,fontWeight:600}}>{p.title}</div>
+                      <div style={{fontSize:12,color:C.m,marginTop:2}}>{fmtSize(p.size)} • {p.voices} voices • {p.samples} samples</div>
+                    </div>
+                    <span style={{fontSize:20,color:C.m}}>→</span>
+                    <span style={S.tag(C.blue)}>.{inst.installFormat.toLowerCase()}</span>
+                  </div>
+                ))}
               </div>
-              <div style={$.card}>
-                <div style={$.cardHead}>⚡ Build & Download</div>
-                <button style={{...$.btn,width:"100%",padding:18,fontSize:16,opacity:gen.loading?0.7:1}} onClick={generate} disabled={gen.loading}>
-                  {gen.loading?`⚙️ Generating... ${gen.pct}%`:"⚡ Generate .PPF Installation File"}
+
+              {/* Convert button */}
+              <div style={S.card}>
+                <div style={S.head}>⚡ Convert</div>
+                <button style={{...S.btn,width:"100%",padding:18,fontSize:16,opacity:gen.loading?0.7:1}} onClick={generate} disabled={gen.loading}>
+                  {gen.loading ? `⚙️ Converting... ${gen.pct}%` : `⚡ Convert to .${inst.installFormat.toLowerCase().toUpperCase()} Installation File`}
                 </button>
-                {gen.loading && <div style={{height:4,background:C.b,borderRadius:2,overflow:"hidden",marginTop:12}}><div style={{height:"100%",width:`${gen.pct}%`,background:`linear-gradient(90deg,${C.a},#ff6b8a)`,borderRadius:2,transition:"width 0.4s"}}/></div>}
-                {gen.result&&!gen.result.error && <div style={{marginTop:20,padding:20,background:"rgba(74,222,128,0.08)",border:"1px solid rgba(74,222,128,0.3)",borderRadius:10}}>
-                  <div style={{color:C.g,fontWeight:700,marginBottom:8,fontSize:16}}>✅ Generated Successfully!</div>
-                  <div style={{fontSize:13,color:C.m,marginBottom:16}}>{gen.result.filename} &nbsp;•&nbsp; {(gen.result.size/1024).toFixed(1)} KB</div>
-                  <a href={gen.result.url} download={gen.result.filename} style={{...$.btn,textDecoration:"none",display:"inline-block"}}>⬇️ Download {gen.result.filename}</a>
+                
+                {gen.loading && <div style={{height:4,background:C.b,borderRadius:2,overflow:"hidden",marginTop:12}}>
+                  <div style={{height:"100%",width:`${gen.pct}%`,background:`linear-gradient(90deg,${C.a},#ff6b8a)`,borderRadius:2,transition:"width 0.4s"}}/>
                 </div>}
-                {gen.result&&gen.result.error && <div style={{marginTop:12,padding:12,background:"rgba(233,69,96,0.1)",border:"1px solid rgba(233,69,96,0.3)",borderRadius:8,color:C.a,fontSize:13}}>❌ {gen.result.error}</div>}
+
+                {/* Log */}
+                {gen.log.length > 0 && <div style={{marginTop:14,padding:14,background:"#080810",borderRadius:8,border:"1px solid #1a1a2a",maxHeight:160,overflowY:"auto"}}>
+                  {gen.log.map((l,i)=>(
+                    <div key={i} style={{fontSize:12,fontFamily:"monospace",marginBottom:3,color:l.type==='error'?C.a:l.type==='success'?C.g:l.type==='warn'?C.am:"#777"}}>
+                      {l.msg}
+                    </div>
+                  ))}
+                </div>}
+
+                {/* Results */}
+                {gen.result && !gen.result.error && <div style={{marginTop:20,padding:20,background:"rgba(74,222,128,0.08)",border:"1px solid rgba(74,222,128,0.3)",borderRadius:10}}>
+                  <div style={{color:C.g,fontWeight:700,marginBottom:14,fontSize:15}}>✅ Conversion Complete!</div>
+                  {gen.result.files.map((f,i)=>(
+                    <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"rgba(74,222,128,0.05)",borderRadius:8,marginBottom:8,border:"1px solid rgba(74,222,128,0.15)"}}>
+                      <span style={{fontSize:22}}>📥</span>
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:14,fontWeight:600}}>{f.fname}</div>
+                        <div style={{fontSize:12,color:C.m,marginTop:2}}>{fmtSize(f.size)}</div>
+                      </div>
+                      <a href={f.url} download={f.fname} style={{...S.btn,textDecoration:"none",display:"inline-block",padding:"8px 16px",fontSize:13}}>⬇️ Download</a>
+                    </div>
+                  ))}
+                  <div style={{marginTop:12,padding:12,background:"rgba(96,165,250,0.08)",borderRadius:8,fontSize:13,color:C.m}}>
+                    <strong style={{color:C.blue}}>How to install on keyboard:</strong>
+                    <ol style={{paddingLeft:18,marginTop:6,lineHeight:1.8}}>
+                      <li>Copy the .{inst.installFormat.toLowerCase()} file to a USB drive</li>
+                      <li>Insert USB drive into your {inst.modelName}</li>
+                      <li>On keyboard: Menu → Expansion Pack → Install from USB</li>
+                      <li>Select the .{inst.installFormat.toLowerCase()} file and confirm installation</li>
+                    </ol>
+                  </div>
+                </div>}
+                {gen.result?.error && <div style={{marginTop:12,padding:12,background:"rgba(233,69,96,0.1)",border:"1px solid rgba(233,69,96,0.3)",borderRadius:8,color:C.a,fontSize:13}}>❌ {gen.result.error}</div>}
               </div>
             </>}
           </div>}
 
+          {/* ══ ABOUT ══ */}
           {tab==="about" && <div>
             <h2 style={{margin:"0 0 24px",fontSize:22,fontWeight:700}}>About</h2>
-            <div style={$.card}>
-              <div style={$.cardHead}>🎵 Yamaha Expansion Manager</div>
+            <div style={S.card}>
+              <div style={S.head}>🎵 Yamaha Expansion Manager</div>
               <div style={{fontSize:14,color:C.m,lineHeight:1.85}}>
-                <p style={{marginTop:0}}>A web-based replica of the official Yamaha Expansion Manager. Import your keyboard's .n27 instrument info, add expansion packs, and generate a compatible .ppf installation file.</p>
-                <p><strong style={{color:C.t}}>Supported:</strong> PSR-SX600/700/900/720/920 • Genos 1/2 • PSR-S670/770/970 • Tyros5 • PSR-E473</p>
-                <p style={{marginBottom:8}}><strong style={{color:C.t}}>File formats:</strong></p>
-                {[[".n27",C.g,"144-byte binary — keyboard identity & firmware info"],[".ppf",C.g,"Unlocked expansion pack — XPFH/BLOB chunk format"],[".ppi",C.g,"Legacy pack format — ZIP-based"],[".cpf",C.am,"Locked/encrypted — cannot be used here"]].map(([e,c,d])=>(
-                  <div key={e} style={{display:"flex",gap:12,marginBottom:8,alignItems:"flex-start"}}>
-                    <code style={{...$.tag(c),fontFamily:"monospace",minWidth:36}}>{e}</code>
-                    <span style={{fontSize:13}}>{d}</span>
-                  </div>
-                ))}
+                <p style={{marginTop:0}}>Converts Yamaha expansion pack files (.ppf) to keyboard-installable format (.ppi or .cpi), identical to the official Yamaha Expansion Manager workflow.</p>
+                
+                <p><strong style={{color:C.t}}>File Formats:</strong></p>
+                <div style={{marginBottom:16}}>
+                  {[[".n27",C.g,"Instrument Identity File — 144-byte binary, identifies your keyboard model and firmware"],
+                    [".ppf",C.g,"Pack Package File — Unlocked expansion pack in XPFH/BLOB chunk format. INPUT."],
+                    [".cpf",C.am,"Content Package File — Locked/encrypted .ppf, instrument-specific. Cannot convert."],
+                    [".ppi",C.blue,"Pack Package Install — ZIP archive for PSR-S series. OUTPUT for older keyboards."],
+                    [".cpi",C.blue,"Content Package Install — ZIP archive for PSR-SX/Genos. OUTPUT for newer keyboards."]].map(([e,c,d])=>(
+                    <div key={e} style={{display:"flex",gap:12,marginBottom:8,alignItems:"flex-start"}}>
+                      <code style={{...S.tag(c),fontFamily:"monospace",minWidth:36,textAlign:"center"}}>{e}</code>
+                      <span style={{fontSize:13}}>{d}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <p><strong style={{color:C.t}}>PPI/CPI Internal Structure:</strong></p>
+                <div style={{background:"#0d0d18",borderRadius:8,padding:14,fontSize:12,fontFamily:"monospace",color:"#888",marginBottom:16,lineHeight:1.8}}>
+                  <div style={{color:C.blue}}>mypack.ppi (ZIP)</div>
+                  <div>├── PackInfo.xml &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Pack metadata &amp; manifest</div>
+                  <div>├── contents/voices/</div>
+                  <div>│ &nbsp;&nbsp;└── VoiceName.uvf &nbsp;&nbsp;&nbsp;&nbsp;← XML voice definition</div>
+                  <div>└── contents/samples/</div>
+                  <div>&nbsp;&nbsp;&nbsp;&nbsp;└── sampleXXX.APCp &nbsp;&nbsp;← Yamaha audio (FORM/YTWV)</div>
+                  <div style={{marginTop:8,color:C.blue}}>mypack.cpi (ZIP)</div>
+                  <div>├── ContentInfo.xml &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Content metadata + instrument binding</div>
+                  <div>├── InstrumentBinding.xml ← n27 firmware binding data</div>
+                  <div>├── data/voices/*.uvf</div>
+                  <div>└── data/samples/*.APCp</div>
+                </div>
+
+                <p><strong style={{color:C.t}}>Supported Instruments:</strong></p>
+                <p>PSR-SX600/700/900/720/920 (→ .cpi) &nbsp;•&nbsp; Genos 1/2 (→ .cpi) &nbsp;•&nbsp; PSR-S670/770/970/775/975 (→ .ppi) &nbsp;•&nbsp; Tyros5 (→ .ppi)</p>
               </div>
             </div>
           </div>}
@@ -307,6 +636,6 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
-  </script>
+</script>
 </body>
 </html>
