@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Yamaha Expansion Manager</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0a0a0f;font-family:'Segoe UI',system-ui,sans-serif;color:#e8e8f0}
+    ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0d0d18}::-webkit-scrollbar-thumb{background:#2a2a3e;border-radius:3px}
+    input,button{font-family:inherit}
+    a{color:inherit}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useCallback, useRef } = React;
+
+function parseN27(buffer) {
+  const b = new Uint8Array(buffer);
+  if (b.length !== 144) throw new Error(`Invalid .n27: expected 144 bytes, got ${b.length}`);
+  const dec = (s, l) => { let r = ""; for (let i = s; i < s + l && b[i]; i++) r += String.fromCharCode(b[i]); return r; };
+  const u16 = (o) => (b[o] << 8) | b[o + 1];
+  const u32 = (o) => ((b[o] << 24) | (b[o+1] << 16) | (b[o+2] << 8) | b[o+3]) >>> 0;
+  const modelName = dec(0, 64), firmwareHash = dec(0x40, 24), versionHash = dec(0x58, 32);
+  const fwMajor = b[0x7A], fm = b[0x7B], fwMinor = ((fm >> 4) * 10) + (fm & 0xF);
+  const buildNumber = u16(0x7C), flags = b[0x7E], timestamp = u32(0x84), typeCategory = u32(0x88);
+  const modelCode = versionHash.includes("_") ? versionHash.split("_")[0] : "";
+  const MM = {"3008":"PSR-S670","3009":"PSR-S770","3010":"PSR-S970","3011":"PSR-S775","3012":"PSR-S975","4000":"PSR-SX600","4001":"PSR-SX600","4012":"PSR-SX700","4013":"PSR-SX700","4014":"PSR-SX900","4015":"PSR-SX920","4016":"PSR-SX720","4020":"Genos","4021":"Genos 2","3020":"Tyros5","5000":"PSR-E473","5001":"PSR-E363"};
+  return { modelName, firmwareHash, versionHash, modelCode, knownModel: MM[modelCode] || modelName, fwVersion: `${fwMajor}.${String(fwMinor).padStart(2, "0")}`, buildNumber, flags, typeCategory, releaseDate: new Date(timestamp * 1000).toLocaleDateString(), timestamp };
+}
+
+function generateGUID() {
+  const h = () => Math.floor(Math.random() * 16).toString(16);
+  const s = (n) => Array.from({ length: n }, h).join("");
+  return `{${s(8)}-${s(4)}-${s(4)}-${s(4)}-${s(12)}}`;
+}
+
+function concatArrays(arrays) {
+  const total = arrays.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(total); let off = 0;
+  for (const a of arrays) { out.set(a, off); off += a.length; }
+  return out;
+}
+
+function writeChunk(tag, data) {
+  const tb = new TextEncoder().encode(tag.padEnd(4, " ").slice(0, 4));
+  const h = new Uint8Array(8); h.set(tb, 0);
+  new DataView(h.buffer).setUint32(4, data.length, false);
+  const p = (4 - (data.length % 4)) % 4;
+  return [h, data, new Uint8Array(p)];
+}
+
+function generatePPF(name, items) {
+  const enc = new TextEncoder();
+  const ns = (s) => { const b = enc.encode(s), o = new Uint8Array(b.length + 1); o.set(b); return o; };
+  const parts = [];
+  parts.push(...writeChunk("XPFH", new Uint8Array(0)));
+  parts.push(...writeChunk("EUID", ns(generateGUID())));
+  parts.push(...writeChunk("ETIT", ns(name)));
+  for (const it of items) {
+    const bl = [];
+    bl.push(...writeChunk("EUID", ns(it.uid || generateGUID())));
+    bl.push(...writeChunk("ETIT", ns(it.name)));
+    bl.push(...writeChunk("EEXT", ns(it.ext)));
+    if (it.icon) bl.push(...writeChunk("EICO", ns(it.icon)));
+    bl.push(...writeChunk("FBIN", it.data));
+    parts.push(...writeChunk("BLOB", concatArrays(bl)));
+  }
+  return concatArrays(parts);
+}
+
+const C = { bg:"#0a0a0f",s:"#13131f",b:"#1e1e2e",a:"#e94560",t:"#e8e8f0",m:"#666",g:"#4ade80",am:"#f59e0b" };
+const $ = {
+  card:{background:C.s,border:`1px solid ${C.b}`,borderRadius:12,padding:24,marginBottom:20},
+  cardHead:{fontSize:12,fontWeight:700,letterSpacing:2,color:C.a,textTransform:"uppercase",marginBottom:16,display:"flex",alignItems:"center",gap:8},
+  btn:{padding:"10px 20px",borderRadius:8,border:"none",cursor:"pointer",fontWeight:700,fontSize:14,background:`linear-gradient(135deg,${C.a},#c73652)`,color:"#fff",boxShadow:"0 4px 15px rgba(233,69,96,0.3)"},
+  ghost:{padding:"6px 14px",borderRadius:6,border:"1px solid rgba(233,69,96,0.3)",cursor:"pointer",background:"rgba(233,69,96,0.08)",color:C.a,fontWeight:600,fontSize:13},
+  sec:{padding:"8px 14px",borderRadius:6,border:`1px solid ${C.b}`,cursor:"pointer",background:"#1e1e2e",color:C.m,fontWeight:600,fontSize:13},
+  drop:(d)=>({border:`2px dashed ${d?C.a:C.b}`,borderRadius:12,padding:"44px 40px",textAlign:"center",cursor:"pointer",background:d?"rgba(233,69,96,0.05)":"transparent",color:d?C.a:C.m,transition:"all 0.2s"}),
+  cell:{background:"#0d0d18",border:"1px solid #1a1a2a",borderRadius:8,padding:"12px 16px"},
+  tag:(c=C.a)=>({display:"inline-block",padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:700,background:`${c}22`,color:c,border:`1px solid ${c}44`,letterSpacing:0.5}),
+  input:{width:"100%",padding:"10px 14px",background:"#0d0d18",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:14,outline:"none",boxSizing:"border-box"},
+};
+
+function App() {
+  const [tab, setTab] = useState("instrument");
+  const [inst, setInst] = useState(null);
+  const [err, setErr] = useState(null);
+  const [dragN, setDragN] = useState(false);
+  const [packs, setPacks] = useState([]);
+  const [dragP, setDragP] = useState(false);
+  const [packName, setPackName] = useState("My Expansion Pack");
+  const [gen, setGen] = useState({ loading: false, pct: 0, result: null });
+  const n27R = useRef(), pkR = useRef();
+
+  const loadN27 = useCallback(async (f) => {
+    if (!f.name.toLowerCase().endsWith(".n27")) { setErr("Must be a .n27 Instrument Info file"); return; }
+    try { const i = parseN27(await f.arrayBuffer()); setInst(i); setErr(null); setPackName(`${i.modelName} Pack`); }
+    catch (e) { setErr(e.message); }
+  }, []);
+
+  const loadPacks = useCallback(async (files) => {
+    const added = [];
+    for (const f of Array.from(files)) {
+      const ext = f.name.split(".").pop().toLowerCase();
+      if (!["ppf","ppi"].includes(ext)) continue;
+      added.push({ id: Math.random().toString(36).slice(2), name: f.name.replace(/\.[^.]+$/, ""), ext, size: f.size, data: new Uint8Array(await f.arrayBuffer()) });
+    }
+    setPacks(p => [...p, ...added]);
+  }, []);
+
+  const generate = useCallback(async () => {
+    if (!inst) return;
+    setGen({ loading: true, pct: 0, result: null });
+    await new Promise(r => setTimeout(r, 100)); setGen(g => ({ ...g, pct: 30 }));
+    const items = packs.length > 0
+      ? packs.map(p => ({ uid: generateGUID(), name: p.name, ext: p.ext, data: p.data }))
+      : [{ uid: generateGUID(), name: "InstrumentInfo", ext: "json", data: new TextEncoder().encode(JSON.stringify({ model: inst.modelName, modelCode: inst.modelCode, firmware: inst.fwVersion, hash: inst.firmwareHash, versionHash: inst.versionHash, buildNumber: inst.buildNumber }, null, 2)) }];
+    await new Promise(r => setTimeout(r, 300)); setGen(g => ({ ...g, pct: 70 }));
+    try {
+      const ppf = generatePPF(packName, items);
+      await new Promise(r => setTimeout(r, 200)); setGen(g => ({ ...g, pct: 95 }));
+      const url = URL.createObjectURL(new Blob([ppf], { type: "application/octet-stream" }));
+      const filename = `${inst.modelName}_${packName.replace(/\s+/g, "_")}.ppf`;
+      setGen({ loading: false, pct: 100, result: { url, filename, size: ppf.length } });
+    } catch (e) { setGen({ loading: false, pct: 0, result: { error: e.message } }); }
+  }, [inst, packs, packName]);
+
+  const TABS = [
+    { id:"instrument", icon:"🎹", label:"Instrument" },
+    { id:"packs",      icon:"📦", label:"Add Packs"  },
+    { id:"generate",   icon:"⚡", label:"Generate"   },
+    { id:"about",      icon:"ℹ️",  label:"About"      },
+  ];
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, color:C.t, display:"flex", flexDirection:"column" }}>
+      <header style={{ background:"linear-gradient(135deg,#1a1a2e,#0f3460)", borderBottom:`2px solid ${C.a}`, padding:"0 24px", display:"flex", alignItems:"center", gap:16, height:58, boxShadow:"0 2px 24px rgba(233,69,96,0.2)", flexShrink:0 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, fontSize:17, fontWeight:700, color:"#fff" }}>
+          <div style={{ width:32, height:32, background:`linear-gradient(135deg,${C.a},#0f3460)`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🎵</div>
+          Yamaha Expansion Manager
+        </div>
+        <div style={{ marginLeft:"auto", display:"flex", gap:10, alignItems:"center" }}>
+          {inst && <span style={$.tag(C.g)}>✓ {inst.modelName}</span>}
+          {packs.length > 0 && <span style={$.tag(C.am)}>{packs.length} pack{packs.length>1?"s":""}</span>}
+        </div>
+      </header>
+      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
+        <nav style={{ width:210, background:"#0d0d18", borderRight:`1px solid ${C.b}`, display:"flex", flexDirection:"column", paddingTop:8, flexShrink:0 }}>
+          {TABS.map(t => (
+            <div key={t.id} style={{ display:"flex", alignItems:"center", gap:12, padding:"11px 20px", cursor:"pointer", borderLeft:`3px solid ${tab===t.id?C.a:"transparent"}`, background:tab===t.id?"rgba(233,69,96,0.12)":"transparent", color:tab===t.id?C.a:C.m, fontSize:14, fontWeight:tab===t.id?600:400, transition:"all 0.15s" }} onClick={()=>setTab(t.id)}>
+              <span style={{fontSize:18}}>{t.icon}</span>{t.label}
+            </div>
+          ))}
+          {inst && (
+            <div style={{ marginTop:"auto", padding:16, borderTop:`1px solid ${C.b}` }}>
+              <div style={{ fontSize:11, color:"#333", marginBottom:5, letterSpacing:1, textTransform:"uppercase" }}>Instrument</div>
+              <div style={{ fontSize:13, fontWeight:700 }}>{inst.modelName}</div>
+              <div style={{ fontSize:11, color:C.m, marginTop:3 }}>FW v{inst.fwVersion} • #{inst.buildNumber}</div>
+              <div style={{ fontSize:11, color:C.m, marginTop:5 }}>{packs.length} pack(s) queued</div>
+            </div>
+          )}
+        </nav>
+        <main style={{ flex:1, padding:"28px 32px", overflowY:"auto" }}>
+
+          {tab==="instrument" && <div>
+            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Import Instrument Info</h2>
+            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Load your keyboard's .n27 file to detect model, firmware, and generate compatible packs.</p>
+            <div style={$.card}>
+              <div style={$.cardHead}>📋 How to get your .n27 file</div>
+              {["Connect your Yamaha keyboard to PC/Mac via USB","Open the official Yamaha Expansion Manager on your computer",'Go to Tools → "Export Instrument Information"',"Select your keyboard model and save the .n27 file","Import that .n27 file here below ↓"].map((s,i)=>(
+                <div key={i} style={{display:"flex",gap:12,marginBottom:10,fontSize:14,color:C.m,alignItems:"flex-start"}}>
+                  <span style={{...$.tag(),minWidth:22,textAlign:"center",flexShrink:0}}>{i+1}</span><span>{s}</span>
+                </div>
+              ))}
+            </div>
+            <div style={$.card}>
+              <div style={$.cardHead}>📂 Import .n27 File</div>
+              <div style={$.drop(dragN)} onDragOver={e=>{e.preventDefault();setDragN(true)}} onDragLeave={()=>setDragN(false)} onDrop={e=>{e.preventDefault();setDragN(false);if(e.dataTransfer.files[0])loadN27(e.dataTransfer.files[0])}} onClick={()=>n27R.current&&n27R.current.click()}>
+                <div style={{fontSize:52,marginBottom:14}}>🎹</div>
+                <div style={{fontSize:16,fontWeight:600,marginBottom:6}}>Drop .n27 file here or click to browse</div>
+                <div style={{fontSize:12,marginTop:8,color:"#444"}}>PSR-SX600/700/900 • Genos 1/2 • PSR-S Series • Tyros5</div>
+              </div>
+              <input ref={n27R} type="file" accept=".n27" style={{display:"none"}} onChange={e=>e.target.files[0]&&loadN27(e.target.files[0])}/>
+              {err && <div style={{marginTop:12,padding:12,background:"rgba(233,69,96,0.1)",border:"1px solid rgba(233,69,96,0.3)",borderRadius:8,color:C.a,fontSize:13}}>⚠️ {err}</div>}
+            </div>
+            {inst && <div style={$.card}>
+              <div style={{...$.cardHead,justifyContent:"space-between"}}><span>✅ Instrument Detected</span><span style={$.tag(C.g)}>Valid .n27</span></div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:20}}>
+                {[["Model Name",inst.modelName],["Known As",inst.knownModel],["Firmware",`v${inst.fwVersion}`],["Build Number",`#${inst.buildNumber}`],["Model Code",inst.modelCode],["FW Hash",inst.firmwareHash],["Version Hash",inst.versionHash],["Release Date",inst.releaseDate],["Type Category",String(inst.typeCategory)],["Flags",`0x${inst.flags.toString(16).toUpperCase()}`]].map(([l,v])=>(
+                  <div key={l} style={$.cell}><div style={{fontSize:11,color:C.m,marginBottom:4,letterSpacing:1,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:l.includes("Hash")?11:14,fontWeight:600,wordBreak:"break-all"}}>{v}</div></div>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:12}}>
+                <button style={$.btn} onClick={()=>setTab("packs")}>Continue → Add Packs</button>
+                <button style={$.ghost} onClick={()=>{setInst(null);setErr(null);setPackName("My Expansion Pack")}}>Reset</button>
+              </div>
+            </div>}
+          </div>}
+
+          {tab==="packs" && <div>
+            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Add Expansion Packs</h2>
+            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Import .ppf or .ppi unlocked pack files to bundle into your installation.</p>
+            {!inst && <div style={{...$.card,borderColor:"rgba(233,69,96,0.3)",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+              <span style={{color:C.a,fontSize:14}}>⚠️ Import your .n27 instrument file first.</span>
+              <button style={$.ghost} onClick={()=>setTab("instrument")}>Go to Instrument →</button>
+            </div>}
+            <div style={$.card}>
+              <div style={$.cardHead}>📂 Import Pack Files</div>
+              <div style={$.drop(dragP)} onDragOver={e=>{e.preventDefault();setDragP(true)}} onDragLeave={()=>setDragP(false)} onDrop={e=>{e.preventDefault();setDragP(false);loadPacks(e.dataTransfer.files)}} onClick={()=>pkR.current&&pkR.current.click()}>
+                <div style={{fontSize:48,marginBottom:14}}>📦</div>
+                <div style={{fontSize:16,fontWeight:600,marginBottom:6}}>Drop .ppf / .ppi files here</div>
+                <div style={{fontSize:13}}>or click to browse — multiple files supported</div>
+                <div style={{fontSize:11,marginTop:8,color:"#444"}}>Unlocked .ppf and .ppi only (encrypted .cpf not supported)</div>
+              </div>
+              <input ref={pkR} type="file" accept=".ppf,.ppi" multiple style={{display:"none"}} onChange={e=>e.target.files.length&&loadPacks(e.target.files)}/>
+            </div>
+            {packs.length>0 && <div style={$.card}>
+              <div style={{...$.cardHead,justifyContent:"space-between"}}>
+                <span>📋 Loaded Packs ({packs.length})</span>
+                <button style={{...$.sec,padding:"4px 12px",fontSize:12}} onClick={()=>setPacks([])}>Clear All</button>
+              </div>
+              {packs.map(p=>(
+                <div key={p.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"#0d0d18",borderRadius:8,marginBottom:8,border:"1px solid #1a1a2a"}}>
+                  <span style={{fontSize:24}}>📦</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:14,fontWeight:600}}>{p.name}</div>
+                    <div style={{fontSize:12,color:C.m,marginTop:2}}>.{p.ext.toUpperCase()} • {(p.size/1024/1024).toFixed(2)} MB</div>
+                  </div>
+                  <button style={{...$.sec,padding:"3px 10px",fontSize:12}} onClick={()=>setPacks(x=>x.filter(i=>i.id!==p.id))}>✕</button>
+                </div>
+              ))}
+              <div style={{marginTop:16}}><button style={$.btn} onClick={()=>setTab("generate")}>Continue → Generate</button></div>
+            </div>}
+            {packs.length===0&&inst && <div style={{...$.card,textAlign:"center",color:C.m}}>
+              <div style={{fontSize:36,marginBottom:10}}>💡</div>
+              <div style={{marginBottom:12,fontSize:14}}>No packs loaded — you can generate instrument metadata only.</div>
+              <button style={$.ghost} onClick={()=>setTab("generate")}>Skip → Generate →</button>
+            </div>}
+          </div>}
+
+          {tab==="generate" && <div>
+            <h2 style={{margin:"0 0 6px",fontSize:22,fontWeight:700}}>Generate Installation File</h2>
+            <p style={{color:C.m,margin:"0 0 24px",fontSize:14}}>Create a .ppf installation file for {inst?inst.modelName:"your keyboard"}.</p>
+            {!inst ? <div style={{...$.card,textAlign:"center",padding:48}}>
+              <div style={{fontSize:48,marginBottom:14}}>⚠️</div>
+              <div style={{fontWeight:600,marginBottom:14,fontSize:16}}>No instrument loaded</div>
+              <button style={$.btn} onClick={()=>setTab("instrument")}>Import .n27 First</button>
+            </div> : <>
+              <div style={$.card}>
+                <div style={$.cardHead}>📋 Generation Summary</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}}>
+                  {[["Target",inst.modelName],["Firmware",`v${inst.fwVersion}`],["Packs",`${packs.length} file${packs.length!==1?"s":""}`],["Output",".PPF Unlocked"]].map(([l,v])=>(
+                    <div key={l} style={$.cell}><div style={{fontSize:11,color:C.m,marginBottom:4,letterSpacing:1,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:14,fontWeight:700}}>{v}</div></div>
+                  ))}
+                </div>
+              </div>
+              <div style={$.card}>
+                <div style={$.cardHead}>✏️ Pack Name</div>
+                <input style={$.input} value={packName} onChange={e=>setPackName(e.target.value)} placeholder="Enter pack name..."/>
+                <div style={{fontSize:11,color:"#444",marginTop:8}}>Output: {inst.modelName}_{packName.replace(/\s+/g,"_")}.ppf</div>
+              </div>
+              <div style={$.card}>
+                <div style={$.cardHead}>⚡ Build & Download</div>
+                <button style={{...$.btn,width:"100%",padding:18,fontSize:16,opacity:gen.loading?0.7:1}} onClick={generate} disabled={gen.loading}>
+                  {gen.loading?`⚙️ Generating... ${gen.pct}%`:"⚡ Generate .PPF Installation File"}
+                </button>
+                {gen.loading && <div style={{height:4,background:C.b,borderRadius:2,overflow:"hidden",marginTop:12}}><div style={{height:"100%",width:`${gen.pct}%`,background:`linear-gradient(90deg,${C.a},#ff6b8a)`,borderRadius:2,transition:"width 0.4s"}}/></div>}
+                {gen.result&&!gen.result.error && <div style={{marginTop:20,padding:20,background:"rgba(74,222,128,0.08)",border:"1px solid rgba(74,222,128,0.3)",borderRadius:10}}>
+                  <div style={{color:C.g,fontWeight:700,marginBottom:8,fontSize:16}}>✅ Generated Successfully!</div>
+                  <div style={{fontSize:13,color:C.m,marginBottom:16}}>{gen.result.filename} &nbsp;•&nbsp; {(gen.result.size/1024).toFixed(1)} KB</div>
+                  <a href={gen.result.url} download={gen.result.filename} style={{...$.btn,textDecoration:"none",display:"inline-block"}}>⬇️ Download {gen.result.filename}</a>
+                </div>}
+                {gen.result&&gen.result.error && <div style={{marginTop:12,padding:12,background:"rgba(233,69,96,0.1)",border:"1px solid rgba(233,69,96,0.3)",borderRadius:8,color:C.a,fontSize:13}}>❌ {gen.result.error}</div>}
+              </div>
+            </>}
+          </div>}
+
+          {tab==="about" && <div>
+            <h2 style={{margin:"0 0 24px",fontSize:22,fontWeight:700}}>About</h2>
+            <div style={$.card}>
+              <div style={$.cardHead}>🎵 Yamaha Expansion Manager</div>
+              <div style={{fontSize:14,color:C.m,lineHeight:1.85}}>
+                <p style={{marginTop:0}}>A web-based replica of the official Yamaha Expansion Manager. Import your keyboard's .n27 instrument info, add expansion packs, and generate a compatible .ppf installation file.</p>
+                <p><strong style={{color:C.t}}>Supported:</strong> PSR-SX600/700/900/720/920 • Genos 1/2 • PSR-S670/770/970 • Tyros5 • PSR-E473</p>
+                <p style={{marginBottom:8}}><strong style={{color:C.t}}>File formats:</strong></p>
+                {[[".n27",C.g,"144-byte binary — keyboard identity & firmware info"],[".ppf",C.g,"Unlocked expansion pack — XPFH/BLOB chunk format"],[".ppi",C.g,"Legacy pack format — ZIP-based"],[".cpf",C.am,"Locked/encrypted — cannot be used here"]].map(([e,c,d])=>(
+                  <div key={e} style={{display:"flex",gap:12,marginBottom:8,alignItems:"flex-start"}}>
+                    <code style={{...$.tag(c),fontFamily:"monospace",minWidth:36}}>{e}</code>
+                    <span style={{fontSize:13}}>{d}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>}
+
+        </main>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
